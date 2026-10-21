@@ -190,6 +190,9 @@ pub async fn compile_tree(
     // Running Python with an actual file will produce better error messages.
     let tempdir = tempdir_in(cache).map_err(CompileError::TempFile)?;
     let pip_compileall_py = tempdir.path().join("pip_compileall.py");
+    fs_err::tokio::write(&pip_compileall_py, COMPILEALL_SCRIPT)
+        .await
+        .map_err(CompileError::TempFile)?;
     let timeout = compile_timeout()?;
     let worker_handles = spawn_workers(
         dir,
@@ -272,6 +275,9 @@ pub async fn compile_files(
     // Running Python with an actual file will produce better error messages.
     let tempdir = tempdir_in(cache).map_err(CompileError::TempFile)?;
     let pip_compileall_py = tempdir.path().join("pip_compileall.py");
+    fs_err::tokio::write(&pip_compileall_py, COMPILEALL_SCRIPT)
+        .await
+        .map_err(CompileError::TempFile)?;
     let timeout = compile_timeout()?;
     let worker_handles = spawn_workers(
         cache,
@@ -322,10 +328,6 @@ async fn worker(
     receiver: Receiver<PathBuf>,
     timeout: Option<Duration>,
 ) -> Result<(), CompileError> {
-    fs_err::tokio::write(&pip_compileall_py, COMPILEALL_SCRIPT)
-        .await
-        .map_err(CompileError::TempFile)?;
-
     // Sometimes, the first time we read from stdout, we get an empty string back (no newline). If
     // we try to write to stdin, it will often be a broken pipe. In this case, we have to restart
     // the child process
@@ -396,6 +398,50 @@ async fn worker(
     debug!("Bytecode compilation worker exiting: {:?}", result);
 
     result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use indoc::indoc;
+
+    use super::{spawn_workers, wait_for_workers};
+
+    #[tokio::test]
+    async fn workers_share_prepared_compiler_script() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        // A shell implementation of the compiler protocol makes script replacement
+        // observable as a startup failure, without relying on thread scheduling.
+        let contents = indoc! {r#"
+            printf 'Ready\n'
+            while IFS= read -r source; do
+                printf '%s\n' "$source"
+            done
+        "#};
+        fs_err::write(&script, contents)?;
+
+        let (sender, receiver) = async_channel::bounded(4);
+        sender.send(temp_dir.path().join("module.py")).await?;
+        drop(sender);
+
+        let handles = spawn_workers(
+            temp_dir.path(),
+            Path::new("/bin/sh"),
+            &script,
+            &receiver,
+            4,
+            Some(Duration::from_secs(1)),
+        );
+        drop(receiver);
+
+        wait_for_workers(handles, None).await?;
+        assert_eq!(fs_err::read_to_string(&script)?, contents);
+        Ok(())
+    }
 }
 
 /// Returns the child and stdin/stdout/stderr on a successful launch or `None` for a broken interpreter state.
