@@ -1,0 +1,80 @@
+name: Bytecode compiler platform tests
+
+on:
+  push:
+    branches: [test/uv-18622-platforms]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bytecode-platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bytecode:
+    if: github.repository == 'EliasCodeFI/uv' && github.event.repository.private == false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      INSTA_UPDATE: "no"
+      INSTA_FORCE_PASS: "0"
+      UV_LINK_MODE: copy
+      UV_PYTHON_DOWNLOADS_JSON_URL: crates/uv-python-managed/download-metadata.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: "0.13.4"
+          enable-cache: false
+          restore-cache: false
+          save-cache: false
+          cache-python: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Install test Python
+        run: uv python install 3.12
+
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          rustc +1.99.0 --version
+          cargo +1.99.0 --version
+          uv python find 3.12
+
+      - name: Check formatting
+        run: cargo +1.99.0 fmt --all -- --check
+
+      - name: Check installer Clippy
+        run: cargo +1.99.0 clippy --locked -p uv-installer --lib --tests -- -D warnings
+
+      - name: Test installer and startup regressions
+        run: cargo +1.99.0 test --locked -p uv-installer --lib -- --test-threads=2
+
+      - name: Test bytecode installation
+        run: cargo +1.99.0 test --locked -p uv --test pip_install compile_bytecode -- --test-threads=2
+
+      - name: Test bytecode synchronization
+        run: cargo +1.99.0 test --locked -p uv --test pip pip_sync::compile -- --exact --test-threads=2
+
+      - name: Test bytecode recompilation
+        run: cargo +1.99.0 test --locked -p uv --test pip pip_sync::recompile -- --exact --test-threads=2
+
+      - name: Check tracked test inputs
+        run: git diff --exit-code -- crates/uv-installer/src/compile.rs Cargo.lock

@@ -22,6 +22,7 @@ use uv_warnings::warn_user;
 const COMPILEALL_SCRIPT: &str = include_str!("pip_compileall.py");
 /// This is longer than any compilation should ever take.
 const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_mins(1);
+const MAX_STARTUP_ATTEMPTS: usize = 3;
 
 type WorkerOutcome = std::thread::Result<Result<(), CompileError>>;
 type WorkerHandle = oneshot::Receiver<WorkerOutcome>;
@@ -61,6 +62,10 @@ pub enum CompileError {
     },
     #[error("Python startup timed out ({}s)", _0.as_secs_f32())]
     StartupTimeout(Duration),
+    #[error("Python interpreter failed to initialize after {0} attempts")]
+    StartupFailed(usize),
+    #[error("Failed to stop Python interpreter after an unsuccessful startup")]
+    PythonTermination(#[source] io::Error),
     #[error("Got invalid value from environment for {var}: {message}.")]
     EnvironmentError { var: &'static str, message: String },
 }
@@ -333,12 +338,17 @@ async fn worker(
     // the child process
     // https://github.com/astral-sh/uv/issues/2245
     let wait_until_ready = async {
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             // If the interpreter started successful, return it, else retry.
             if let Some(child) =
                 launch_bytecode_compiler(&dir, &interpreter, &pip_compileall_py).await?
             {
                 break Ok::<_, CompileError>(child);
+            }
+            if attempts >= MAX_STARTUP_ATTEMPTS {
+                break Err(CompileError::StartupFailed(attempts));
             }
         }
     };
@@ -349,7 +359,7 @@ async fn worker(
         if let Some(duration) = timeout {
             tokio::time::timeout(duration, wait_until_ready)
                 .await
-                .map_err(|_| CompileError::StartupTimeout(timeout.unwrap()))??
+                .map_err(|_| CompileError::StartupTimeout(duration))??
         } else {
             wait_until_ready.await?
         };
@@ -400,50 +410,6 @@ async fn worker(
     result
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use std::path::Path;
-    use std::time::Duration;
-
-    use anyhow::Result;
-    use indoc::indoc;
-
-    use super::{spawn_workers, wait_for_workers};
-
-    #[tokio::test]
-    async fn workers_share_prepared_compiler_script() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let script = temp_dir.path().join("pip_compileall.py");
-        // A shell implementation of the compiler protocol makes script replacement
-        // observable as a startup failure, without relying on thread scheduling.
-        let contents = indoc! {r#"
-            printf 'Ready\n'
-            while IFS= read -r source; do
-                printf '%s\n' "$source"
-            done
-        "#};
-        fs_err::write(&script, contents)?;
-
-        let (sender, receiver) = async_channel::bounded(4);
-        sender.send(temp_dir.path().join("module.py")).await?;
-        drop(sender);
-
-        let handles = spawn_workers(
-            temp_dir.path(),
-            Path::new("/bin/sh"),
-            &script,
-            &receiver,
-            4,
-            Some(Duration::from_secs(1)),
-        );
-        drop(receiver);
-
-        wait_for_workers(handles, None).await?;
-        assert_eq!(fs_err::read_to_string(&script)?, contents);
-        Ok(())
-    }
-}
-
 /// Returns the child and stdin/stdout/stderr on a successful launch or `None` for a broken interpreter state.
 async fn launch_bytecode_compiler(
     dir: &Path,
@@ -464,6 +430,7 @@ async fn launch_bytecode_compiler(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .current_dir(dir)
         // Otherwise stdout is buffered and we'll wait forever for a response
         .env(EnvVars::PYTHONUNBUFFERED, "1")
@@ -507,12 +474,17 @@ async fn launch_bytecode_compiler(
             child_stdout,
             child_stderr,
         )))
-    } else if out_line.is_empty() {
-        // Failed to launch, try again
-        Ok(None)
     } else {
-        // Not observed yet
-        Err(CompileError::WrongPath("Ready".to_string(), out_line))
+        // EOF can arrive while the interpreter is still running. Reap it before retrying.
+        bytecode_compiler
+            .kill()
+            .await
+            .map_err(CompileError::PythonTermination)?;
+        if out_line.is_empty() {
+            Ok(None)
+        } else {
+            Err(CompileError::WrongPath("Ready".to_string(), out_line))
+        }
     }
 }
 
@@ -575,4 +547,259 @@ async fn worker_main_loop(
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use std::io;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use indoc::indoc;
+
+    use uv_cache::Cache;
+    use uv_python_discovery::find_environment;
+    use uv_python_types::{EnvironmentPreference, PythonPreference, PythonRequest};
+
+    #[cfg(target_os = "linux")]
+    use super::launch_bytecode_compiler;
+    use super::{spawn_workers, wait_for_workers, worker};
+
+    fn python_executable() -> Result<PathBuf> {
+        let _preview = uv_preview::test::with_features(&[]);
+        let cache = Cache::temp()?;
+        let environment = find_environment(
+            &PythonRequest::Any,
+            EnvironmentPreference::Any,
+            PythonPreference::System,
+            None,
+            &cache,
+        )?;
+        Ok(environment.interpreter().sys_executable().to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn worker_limits_empty_startup_retries_without_timeout() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        let python = python_executable()?;
+        fs_err::write(
+            &script,
+            indoc! {r#"
+                with open("attempts", "a", encoding="utf-8", newline="\n") as attempts:
+                    attempts.write("attempt\n")
+            "#},
+        )?;
+
+        let (sender, receiver) = async_channel::bounded(1);
+        drop(sender);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker(
+                temp_dir.path().to_path_buf(),
+                python,
+                script,
+                receiver,
+                None,
+            ),
+        )
+        .await;
+
+        let attempts = fs_err::read_to_string(temp_dir.path().join("attempts"))?;
+        assert!(
+            result.is_ok(),
+            "Startup kept retrying after {} failed attempts",
+            attempts.lines().count(),
+        );
+        let error = result?.expect_err("An interpreter that never becomes ready must fail");
+        insta::assert_snapshot!(error.to_string(), @"Python interpreter failed to initialize after 3 attempts");
+        assert_eq!(attempts, "attempt\nattempt\nattempt\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_from_empty_startup_responses() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        let python = python_executable()?;
+        fs_err::write(
+            &script,
+            indoc! {r#"
+                import sys
+
+                with open("attempts", "a", encoding="utf-8", newline="\n") as attempts:
+                    attempts.write("attempt\n")
+                with open("attempts", encoding="utf-8") as attempts:
+                    if len(attempts.read().splitlines()) < 3:
+                        sys.exit(0)
+                print("Ready")
+                for source in sys.stdin:
+                    source = source.rstrip("\r\n")
+                    with open("compiled", "a", encoding="utf-8", newline="\n") as compiled:
+                        compiled.write(source + "\n")
+                    print(source)
+            "#},
+        )?;
+
+        let source = temp_dir.path().join("module.py");
+        let (sender, receiver) = async_channel::bounded(1);
+        sender.send(source.clone()).await?;
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            worker(
+                temp_dir.path().to_path_buf(),
+                python,
+                script,
+                receiver,
+                None,
+            ),
+        )
+        .await??;
+
+        assert_eq!(
+            fs_err::read_to_string(temp_dir.path().join("attempts"))?,
+            "attempt\nattempt\nattempt\n",
+        );
+        assert_eq!(
+            fs_err::read_to_string(temp_dir.path().join("compiled"))?,
+            format!("{}\n", source.display()),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_allows_slow_startup_without_timeout() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        let python = python_executable()?;
+        fs_err::write(&script, "import time\ntime.sleep(1)\nprint('Ready')\n")?;
+
+        let (sender, receiver) = async_channel::bounded(1);
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            worker(
+                temp_dir.path().to_path_buf(),
+                python,
+                script,
+                receiver,
+                None,
+            ),
+        )
+        .await??;
+        Ok(())
+    }
+
+    /// Closing stdout does not imply that the interpreter has exited.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_startup_reaps_interpreter() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        fs_err::write(
+            &script,
+            "printf '%s\\n' \"$$\" > interpreter.pid\nexec 1>&-\nexec sleep 30\n",
+        )?;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            launch_bytecode_compiler(temp_dir.path(), Path::new("/bin/sh"), &script),
+        )
+        .await??;
+        assert!(result.is_none());
+
+        let process_id = fs_err::read_to_string(temp_dir.path().join("interpreter.pid"))?;
+        let running = Path::new("/proc").join(process_id.trim()).try_exists()?;
+        if running {
+            Command::new("kill")
+                .args(["-KILL", process_id.trim()])
+                .output()?;
+        }
+        assert!(!running, "The failed startup process was not reaped");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_timeout_kills_interpreter() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        fs_err::write(
+            &script,
+            "printf '%s\\n' \"$$\" > interpreter.pid\nexec sleep 30\n",
+        )?;
+
+        let (sender, receiver) = async_channel::bounded(1);
+        drop(sender);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker(
+                temp_dir.path().to_path_buf(),
+                Path::new("/bin/sh").to_path_buf(),
+                script,
+                receiver,
+                Some(Duration::from_secs(1)),
+            ),
+        )
+        .await?
+        .expect_err("An interpreter that never becomes ready must time out");
+        insta::assert_snapshot!(error.to_string(), @"Python startup timed out (1s)");
+
+        let process_id = fs_err::read_to_string(temp_dir.path().join("interpreter.pid"))?;
+        let process_path = Path::new("/proc").join(process_id.trim());
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            while process_path.try_exists()? {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), io::Error>(())
+        })
+        .await;
+        if exited.is_err() {
+            Command::new("kill")
+                .args(["-KILL", process_id.trim()])
+                .output()?;
+        }
+        exited??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workers_share_prepared_compiler_script() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let script = temp_dir.path().join("pip_compileall.py");
+        let python = python_executable()?;
+        // An alternate protocol implementation detects workers replacing the prepared helper.
+        let contents = indoc! {r#"
+            import sys
+
+            print("Ready")
+            for source in sys.stdin:
+                print(source.rstrip("\r\n"))
+        "#};
+        fs_err::write(&script, contents)?;
+
+        let (sender, receiver) = async_channel::bounded(4);
+        sender.send(temp_dir.path().join("module.py")).await?;
+        drop(sender);
+
+        let handles = spawn_workers(
+            temp_dir.path(),
+            &python,
+            &script,
+            &receiver,
+            4,
+            Some(Duration::from_secs(5)),
+        );
+        drop(receiver);
+
+        wait_for_workers(handles, None).await?;
+        assert_eq!(fs_err::read_to_string(&script)?, contents);
+        Ok(())
+    }
 }
